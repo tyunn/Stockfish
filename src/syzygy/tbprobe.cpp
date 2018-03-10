@@ -133,19 +133,6 @@ struct Atomic {
     std::atomic_bool ready;
 };
 
-struct TBEntryBase : public Atomic {
-    void* baseAddress;
-    uint64_t mapping;
-    Key key;
-    Key key2;
-    int pieceCount;
-    bool hasPawns;
-    bool hasUniquePieces;
-    uint8_t pawnCount[2]; // [Lead color / other color]
-
-    ~TBEntryBase();
-};
-
 // We define types for the different parts of the TBEntry<WDL> and TBEntry<DTZ>
 // with corresponding specializations for pieces or pawns.
 
@@ -166,32 +153,42 @@ struct EntryPiece<DTZ> {
 };
 
 template<TBType Type>
+struct TBEntryBase : public Atomic {
+    typedef typename std::conditional<Type == WDL, WDLScore, int>::type Result;
+
+    static constexpr int Sides = Type == WDL ? 2 : 1;
+
+    void* baseAddress;
+    uint64_t mapping;
+    Key key;
+    Key key2;
+    int pieceCount;
+    bool hasPawns;
+    bool hasUniquePieces;
+    uint8_t pawnCount[2]; // [Lead color / other color]
+    EntryPiece<Type> file[Sides][4]; // [wtm / btm][FILE_A..FILE_D]
+
+    EntryPiece<Type>& getItem(int stm, int f) {
+        return file[stm % Sides][hasPawns ? f : 0];
+    }
+
+    ~TBEntryBase();
+};
+
+template<TBType Type>
 struct TBEntry { };
 
 // Now the main types: TBEntry<WDL> and TBEntry<DTZ>
 template<>
-struct TBEntry<WDL> : public TBEntryBase {
-    typedef WDLScore Result;
-
-    EntryPiece<WDL> file[2][4]; // [wtm / btm][FILE_A..FILE_D]
-
-    EntryPiece<WDL>& getItem(int stm, int f) {
-        return file[stm][hasPawns ? f : 0];
-    }
-
-    TBEntry<WDL>(const std::string& code);
+struct TBEntry<WDL> : public TBEntryBase<WDL> {
+    TBEntry(const std::string& code);
 };
 
 template<>
-struct TBEntry<DTZ> : public TBEntryBase {
-    typedef int Result;
-
-    EntryPiece<DTZ> file[4];
+struct TBEntry<DTZ> : public TBEntryBase<DTZ> {
     uint8_t* map;
 
-    EntryPiece<DTZ>& getItem(int, int f) { return file[hasPawns ? f : 0]; }
-
-    TBEntry<DTZ>(const TBEntry<WDL>& wdl);
+    TBEntry(const TBEntry<WDL>& wdl);
 };
 
 TBEntry<WDL>::TBEntry(const std::string& code) {
@@ -440,7 +437,8 @@ public:
 
 std::string TBFile::Paths;
 
-TBEntryBase::~TBEntryBase() {
+template<TBType Type>
+TBEntryBase<Type>::~TBEntryBase() {
     if (baseAddress)
         TBFile::unmap(baseAddress, mapping);
 }
