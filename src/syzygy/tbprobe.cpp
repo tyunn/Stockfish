@@ -133,31 +133,7 @@ struct Atomic {
     std::atomic_bool ready;
 };
 
-// We define types for the different parts of the WDLEntry and DTZEntry with
-// corresponding specializations for pieces or pawns.
-
-struct WDLEntryPiece {
-    PairsData* precomp;
-};
-
-struct WDLEntryPawn {
-    uint8_t pawnCount[2];     // [Lead color / other color]
-    WDLEntryPiece file[2][4]; // [wtm / btm][FILE_A..FILE_D]
-};
-
-struct DTZEntryPiece {
-    PairsData* precomp;
-    uint16_t map_idx[4]; // WDLWin, WDLLoss, WDLCursedWin, WDLBlessedLoss
-    uint8_t* map;
-};
-
-struct DTZEntryPawn {
-    uint8_t pawnCount[2];
-    DTZEntryPiece file[4];
-    uint8_t* map;
-};
-
-struct TBEntry : public Atomic {
+struct TBEntryBase : public Atomic {
     void* baseAddress;
     uint64_t mapping;
     Key key;
@@ -165,39 +141,100 @@ struct TBEntry : public Atomic {
     int pieceCount;
     bool hasPawns;
     bool hasUniquePieces;
+    uint8_t pawnCount[2]; // [Lead color / other color]
+
+    ~TBEntryBase();
 };
 
-// Now the main types: WDLEntry and DTZEntry
-struct WDLEntry : public TBEntry {
-    WDLEntry(const std::string& code);
-   ~WDLEntry();
-    union {
-        WDLEntryPiece pieceTable[2]; // [wtm / btm]
-        WDLEntryPawn  pawnTable;
-    };
+// We define types for the different parts of the TBEntry<WDL> and TBEntry<DTZ>
+// with corresponding specializations for pieces or pawns.
+
+enum TBType { WDL, DTZ };
+
+template<TBType Type>
+struct EntryPiece { };
+
+template<>
+struct EntryPiece<WDL> {
+    std::unique_ptr<PairsData> precomp;
 };
 
-struct DTZEntry : public TBEntry {
-    DTZEntry(const WDLEntry& wdl);
-   ~DTZEntry();
-    union {
-        DTZEntryPiece pieceTable;
-        DTZEntryPawn  pawnTable;
-    };
+template<>
+struct EntryPiece<DTZ> {
+    std::unique_ptr<PairsData> precomp;
+    uint16_t map_idx[4]; // WDLWin, WDLLoss, WDLCursedWin, WDLBlessedLoss
 };
 
-typedef decltype(WDLEntry::pieceTable) WDLPieceTable;
-typedef decltype(DTZEntry::pieceTable) DTZPieceTable;
-typedef decltype(WDLEntry::pawnTable ) WDLPawnTable;
-typedef decltype(DTZEntry::pawnTable ) DTZPawnTable;
+template<TBType Type>
+struct TBEntry { };
 
-auto item(WDLPieceTable& e, int stm, int  ) -> decltype(e[stm])& { return e[stm]; }
-auto item(DTZPieceTable& e, int    , int  ) -> decltype(e)& { return e; }
-auto item(WDLPawnTable&  e, int stm, int f) -> decltype(e.file[stm][f])& { return e.file[stm][f]; }
-auto item(DTZPawnTable&  e, int    , int f) -> decltype(e.file[f])& { return e.file[f]; }
+// Now the main types: TBEntry<WDL> and TBEntry<DTZ>
+template<>
+struct TBEntry<WDL> : public TBEntryBase {
+    typedef WDLScore Result;
 
-template<typename E> struct Ret { typedef int type; };
-template<> struct Ret<WDLEntry> { typedef WDLScore type; };
+    EntryPiece<WDL> file[2][4]; // [wtm / btm][FILE_A..FILE_D]
+
+    EntryPiece<WDL>& getItem(int stm, int f) {
+        return file[stm][hasPawns ? f : 0];
+    }
+
+    TBEntry<WDL>(const std::string& code);
+};
+
+template<>
+struct TBEntry<DTZ> : public TBEntryBase {
+    typedef int Result;
+
+    EntryPiece<DTZ> file[4];
+    uint8_t* map;
+
+    EntryPiece<DTZ>& getItem(int, int f) { return file[hasPawns ? f : 0]; }
+
+    TBEntry<DTZ>(const TBEntry<WDL>& wdl);
+};
+
+TBEntry<WDL>::TBEntry(const std::string& code) {
+
+    StateInfo st;
+    Position pos;
+
+    key = pos.set(code, WHITE, &st).material_key();
+    pieceCount = popcount(pos.pieces());
+    hasPawns = pos.pieces(PAWN);
+
+    for (Color c = WHITE; c <= BLACK; ++c)
+        for (PieceType pt = PAWN; pt < KING; ++pt)
+            if (popcount(pos.pieces(c, pt)) == 1)
+                hasUniquePieces = true;
+
+    if (hasPawns) {
+        // Set the leading color. In case both sides have pawns the leading color
+        // is the side with less pawns because this leads to better compression.
+        bool c =   !pos.count<PAWN>(BLACK)
+                || (   pos.count<PAWN>(WHITE)
+                    && pos.count<PAWN>(BLACK) >= pos.count<PAWN>(WHITE));
+
+        pawnCount[0] = pos.count<PAWN>(c ? WHITE : BLACK);
+        pawnCount[1] = pos.count<PAWN>(c ? BLACK : WHITE);
+    }
+
+    key2 = pos.set(code, BLACK, &st).material_key();
+}
+
+TBEntry<DTZ>::TBEntry(const TBEntry<WDL>& wdl) {
+
+    key = wdl.key;
+    key2 = wdl.key2;
+    pieceCount = wdl.pieceCount;
+    hasPawns = wdl.hasPawns;
+    hasUniquePieces = wdl.hasUniquePieces;
+
+    if (hasPawns) {
+        pawnCount[0] = wdl.pawnCount[0];
+        pawnCount[1] = wdl.pawnCount[1];
+    }
+}
 
 int MapPawns[SQUARE_NB];
 int MapB1H1H7[SQUARE_NB];
@@ -252,23 +289,21 @@ template<typename T, int LE> T number(void* addr)
 
 class HashTable {
 
-    typedef std::pair<WDLEntry*, DTZEntry*> EntryPair;
+    typedef std::pair<TBEntry<WDL>*, TBEntry<DTZ>*> EntryPair;
     typedef std::pair<Key, EntryPair> Entry;
 
     static const int TBHASHBITS = 10;
     static const int HSHMAX     = 5;
 
-    Entry hashTable[1 << TBHASHBITS][HSHMAX];
+    std::array<std::array<Entry, HSHMAX>, 1 << TBHASHBITS> hashTable;
 
-    std::deque<WDLEntry> wdlTable;
-    std::deque<DTZEntry> dtzTable;
+    std::deque<TBEntry<WDL>> wdlTable;
+    std::deque<TBEntry<DTZ>> dtzTable;
 
-    void insert(Key key, WDLEntry* wdl, DTZEntry* dtz) {
-        Entry* entry = hashTable[key >> (64 - TBHASHBITS)];
-
-        for (int i = 0; i < HSHMAX; ++i, ++entry)
-            if (!entry->second.first || entry->first == key) {
-                *entry = std::make_pair(key, std::make_pair(wdl, dtz));
+    void insert(Key key, TBEntry<WDL>* wdl, TBEntry<DTZ>* dtz) {
+        for (Entry &entry : hashTable[key >> (64 - TBHASHBITS)])
+            if (!entry.second.first || entry.first == key) {
+                entry = std::make_pair(key, std::make_pair(wdl, dtz));
                 return;
             }
 
@@ -277,24 +312,22 @@ class HashTable {
     }
 
 public:
-    template<typename E, int I = std::is_same<E, WDLEntry>::value ? 0 : 1>
-    E* get(Key key) {
-      Entry* entry = hashTable[key >> (64 - TBHASHBITS)];
+    template<TBType Type>
+    TBEntry<Type>* get(Key key) {
+        for (Entry &entry : hashTable[key >> (64 - TBHASHBITS)])
+            if (entry.first == key)
+                return std::get<Type>(entry.second);
 
-      for (int i = 0; i < HSHMAX; ++i, ++entry)
-          if (entry->first == key)
-              return std::get<I>(entry->second);
+        return nullptr;
+    }
 
-      return nullptr;
-  }
-
-  void clear() {
-      std::memset(hashTable, 0, sizeof(hashTable));
-      wdlTable.clear();
-      dtzTable.clear();
-  }
-  size_t size() const { return wdlTable.size(); }
-  void insert(const std::vector<PieceType>& pieces);
+    void clear() {
+        hashTable = {};
+        wdlTable.clear();
+        dtzTable.clear();
+    }
+    size_t size() const { return wdlTable.size(); }
+    void insert(const std::vector<PieceType>& pieces);
 };
 
 HashTable EntryTable;
@@ -407,77 +440,9 @@ public:
 
 std::string TBFile::Paths;
 
-WDLEntry::WDLEntry(const std::string& code) {
-
-    StateInfo st;
-    Position pos;
-
-    memset(this, 0, sizeof(WDLEntry));
-
-    ready = false;
-    key = pos.set(code, WHITE, &st).material_key();
-    pieceCount = popcount(pos.pieces());
-    hasPawns = pos.pieces(PAWN);
-
-    for (Color c = WHITE; c <= BLACK; ++c)
-        for (PieceType pt = PAWN; pt < KING; ++pt)
-            if (popcount(pos.pieces(c, pt)) == 1)
-                hasUniquePieces = true;
-
-    if (hasPawns) {
-        // Set the leading color. In case both sides have pawns the leading color
-        // is the side with less pawns because this leads to better compression.
-        bool c =   !pos.count<PAWN>(BLACK)
-                || (   pos.count<PAWN>(WHITE)
-                    && pos.count<PAWN>(BLACK) >= pos.count<PAWN>(WHITE));
-
-        pawnTable.pawnCount[0] = pos.count<PAWN>(c ? WHITE : BLACK);
-        pawnTable.pawnCount[1] = pos.count<PAWN>(c ? BLACK : WHITE);
-    }
-
-    key2 = pos.set(code, BLACK, &st).material_key();
-}
-
-WDLEntry::~WDLEntry() {
-
+TBEntryBase::~TBEntryBase() {
     if (baseAddress)
         TBFile::unmap(baseAddress, mapping);
-
-    for (int i = 0; i < 2; ++i)
-        if (hasPawns)
-            for (File f = FILE_A; f <= FILE_D; ++f)
-                delete pawnTable.file[i][f].precomp;
-        else
-            delete pieceTable[i].precomp;
-}
-
-DTZEntry::DTZEntry(const WDLEntry& wdl) {
-
-    memset(this, 0, sizeof(DTZEntry));
-
-    ready = false;
-    key = wdl.key;
-    key2 = wdl.key2;
-    pieceCount = wdl.pieceCount;
-    hasPawns = wdl.hasPawns;
-    hasUniquePieces = wdl.hasUniquePieces;
-
-    if (hasPawns) {
-        pawnTable.pawnCount[0] = wdl.pawnTable.pawnCount[0];
-        pawnTable.pawnCount[1] = wdl.pawnTable.pawnCount[1];
-    }
-}
-
-DTZEntry::~DTZEntry() {
-
-    if (baseAddress)
-        TBFile::unmap(baseAddress, mapping);
-
-    if (hasPawns)
-        for (File f = FILE_A; f <= FILE_D; ++f)
-            delete pawnTable.file[f].precomp;
-    else
-        delete pieceTable.precomp;
 }
 
 void HashTable::insert(const std::vector<PieceType>& pieces) {
@@ -630,13 +595,11 @@ int decompress_pairs(PairsData* d, uint64_t idx) {
     return d->btree[sym].get<LR::Value>();
 }
 
-bool check_dtz_stm(WDLEntry*, int, File) { return true; }
+bool check_dtz_stm(TBEntry<WDL>*, int, File) { return true; }
 
-bool check_dtz_stm(DTZEntry* entry, int stm, File f) {
+bool check_dtz_stm(TBEntry<DTZ>* entry, int stm, File f) {
 
-    int flags = entry->hasPawns ? entry->pawnTable.file[f].precomp->flags
-                                : entry->pieceTable.precomp->flags;
-
+    int flags = entry->getItem(stm, f).precomp->flags;
     return   (flags & TBFlag::STM) == stm
           || ((entry->key == entry->key2) && !entry->hasPawns);
 }
@@ -645,20 +608,16 @@ bool check_dtz_stm(DTZEntry* entry, int stm, File f) {
 // values 0, 1, 2, ... in order of decreasing frequency. This is done for each
 // of the four WDLScore values. The mapping information necessary to reconstruct
 // the original values is stored in the TB file and read during map[] init.
-WDLScore map_score(WDLEntry*, File, int value, WDLScore) { return WDLScore(value - 2); }
+WDLScore map_score(TBEntry<WDL>*, File, int value, WDLScore) { return WDLScore(value - 2); }
 
-int map_score(DTZEntry* entry, File f, int value, WDLScore wdl) {
+int map_score(TBEntry<DTZ>* entry, File f, int value, WDLScore wdl) {
 
     const int WDLMap[] = { 1, 3, 0, 2, 0 };
 
-    int flags = entry->hasPawns ? entry->pawnTable.file[f].precomp->flags
-                                : entry->pieceTable.precomp->flags;
+    int flags = entry->getItem(0, f).precomp->flags;
 
-    uint8_t* map = entry->hasPawns ? entry->pawnTable.map
-                                   : entry->pieceTable.map;
-
-    uint16_t* idx = entry->hasPawns ? entry->pawnTable.file[f].map_idx
-                                    : entry->pieceTable.map_idx;
+    uint8_t* map = entry->map;
+    uint16_t* idx = entry->getItem(0, f).map_idx;
     if (flags & TBFlag::Mapped)
         value = map[idx[WDLMap[wdl + 2]] + value];
 
@@ -679,10 +638,8 @@ int map_score(DTZEntry* entry, File f, int value, WDLScore wdl) {
 //
 //      idx = Binomial[1][s1] + Binomial[2][s2] + ... + Binomial[k][sk]
 //
-template<typename Entry, typename T = typename Ret<Entry>::type>
-T do_probe_table(const Position& pos, Entry* entry, WDLScore wdl, ProbeState* result) {
-
-    const bool IsWDL = std::is_same<Entry, WDLEntry>::value;
+template<TBType Type, typename T = typename TBEntry<Type>::Result>
+T do_probe_table(const Position& pos, TBEntry<Type>* entry, WDLScore wdl, ProbeState* result) {
 
     Square squares[TBPIECES];
     Piece pieces[TBPIECES];
@@ -715,7 +672,7 @@ T do_probe_table(const Position& pos, Entry* entry, WDLScore wdl, ProbeState* re
 
         // In all the 4 tables, pawns are at the beginning of the piece sequence and
         // their color is the reference one. So we just pick the first one.
-        Piece pc = Piece(item(entry->pawnTable, 0, 0).precomp->pieces[0] ^ flipColor);
+        Piece pc = Piece(entry->getItem(0, 0).precomp->pieces[0] ^ flipColor);
 
         assert(type_of(pc) == PAWN);
 
@@ -732,14 +689,14 @@ T do_probe_table(const Position& pos, Entry* entry, WDLScore wdl, ProbeState* re
         if (tbFile > FILE_D)
             tbFile = file_of(squares[0] ^ 7); // Horizontal flip: SQ_H1 -> SQ_A1
 
-        d = item(entry->pawnTable , stm, tbFile).precomp;
+        d = entry->getItem(stm, tbFile).precomp.get();
     } else
-        d = item(entry->pieceTable, stm, tbFile).precomp;
+        d = entry->getItem(stm, tbFile).precomp.get();
 
     // DTZ tables are one-sided, i.e. they store positions only for white to
     // move or only for black to move, so check for side to move to be stm,
     // early exit otherwise.
-    if (!IsWDL && !check_dtz_stm(entry, stm, tbFile))
+    if (Type == DTZ && !check_dtz_stm(entry, stm, tbFile))
         return *result = CHANGE_STM, T();
 
     // Now we are ready to get all the position pieces (but the lead pawns) and
@@ -872,7 +829,7 @@ encode_remaining:
     Square* groupSq = squares + d->groupLen[0];
 
     // Encode remainig pawns then pieces according to square, in ascending order
-    bool remainingPawns = entry->hasPawns && entry->pawnTable.pawnCount[1];
+    bool remainingPawns = entry->hasPawns && entry->pawnCount[1];
 
     while (d->groupLen[++next])
     {
@@ -907,8 +864,8 @@ encode_remaining:
 //
 // The actual grouping depends on the TB generator and can be inferred from the
 // sequence of pieces in piece[] array.
-template<typename T>
-void set_groups(T& e, PairsData* d, int order[], File f) {
+template<TBType Type>
+void set_groups(TBEntry<Type>& e, PairsData* d, int order[], File f) {
 
     int n = 0, firstLen = e.hasPawns ? 0 : e.hasUniquePieces ? 3 : 2;
     d->groupLen[n] = 1;
@@ -934,7 +891,7 @@ void set_groups(T& e, PairsData* d, int order[], File f) {
     // pawns/pieces -> remainig pawns -> remaining pieces. In particular the
     // first group is at order[0] position and the remaining pawns, when present,
     // are at order[1] position.
-    bool pp = e.hasPawns && e.pawnTable.pawnCount[1]; // Pawns on both sides
+    bool pp = e.hasPawns && e.pawnCount[1]; // Pawns on both sides
     int next = pp ? 2 : 1;
     int freeSquares = 64 - d->groupLen[0] - (pp ? d->groupLen[1] : 0);
     uint64_t idx = 1;
@@ -1048,18 +1005,16 @@ uint8_t* set_sizes(PairsData* d, uint8_t* data) {
     return data + d->symlen.size() * sizeof(LR) + (d->symlen.size() & 1);
 }
 
-template<typename T>
-uint8_t* set_dtz_map(WDLEntry&, T&, uint8_t*, File) { return nullptr; }
+uint8_t* set_dtz_map(TBEntry<WDL>&, uint8_t*, File) { return nullptr; }
 
-template<typename T>
-uint8_t* set_dtz_map(DTZEntry&, T& p, uint8_t* data, File maxFile) {
+uint8_t* set_dtz_map(TBEntry<DTZ>& e, uint8_t* data, File maxFile) {
 
-    p.map = data;
+    e.map = data;
 
     for (File f = FILE_A; f <= maxFile; ++f) {
-        if (item(p, 0, f).precomp->flags & TBFlag::Mapped)
+        if (e.getItem(0, f).precomp->flags & TBFlag::Mapped)
             for (int i = 0; i < 4; ++i) { // Sequence like 3,x,x,x,1,x,0,2,x,x
-                item(p, 0, f).map_idx[i] = (uint16_t)(data - p.map + 1);
+                e.getItem(0, f).map_idx[i] = (uint16_t)(data - e.map + 1);
                 data += *data + 1;
             }
     }
@@ -1067,10 +1022,8 @@ uint8_t* set_dtz_map(DTZEntry&, T& p, uint8_t* data, File maxFile) {
     return data += (uintptr_t)data & 1; // Word alignment
 }
 
-template<typename Entry, typename T>
-void do_init(Entry& e, T& p, uint8_t* data) {
-
-    const bool IsWDL = std::is_same<Entry, WDLEntry>::value;
+template<TBType Type>
+void do_init(TBEntry<Type>& e, uint8_t* data) {
 
     PairsData* d;
 
@@ -1081,17 +1034,17 @@ void do_init(Entry& e, T& p, uint8_t* data) {
 
     data++; // First byte stores flags
 
-    const int Sides = IsWDL && (e.key != e.key2) ? 2 : 1;
+    const int Sides = Type == WDL && (e.key != e.key2) ? 2 : 1;
     const File MaxFile = e.hasPawns ? FILE_D : FILE_A;
 
-    bool pp = e.hasPawns && e.pawnTable.pawnCount[1]; // Pawns on both sides
+    bool pp = e.hasPawns && e.pawnCount[1]; // Pawns on both sides
 
-    assert(!pp || e.pawnTable.pawnCount[0]);
+    assert(!pp || e.table.pawnCount[0]);
 
     for (File f = FILE_A; f <= MaxFile; ++f) {
 
         for (int i = 0; i < Sides; i++)
-            item(p, i, f).precomp = new PairsData();
+            e.getItem(i, f).precomp = std::unique_ptr<PairsData>(new PairsData());
 
         int order[][2] = { { *data & 0xF, pp ? *(data + 1) & 0xF : 0xF },
                            { *data >>  4, pp ? *(data + 1) >>  4 : 0xF } };
@@ -1099,45 +1052,43 @@ void do_init(Entry& e, T& p, uint8_t* data) {
 
         for (int k = 0; k < e.pieceCount; ++k, ++data)
             for (int i = 0; i < Sides; i++)
-                item(p, i, f).precomp->pieces[k] = Piece(i ? *data >>  4 : *data & 0xF);
+                e.getItem(i, f).precomp->pieces[k] = Piece(i ? *data >>  4 : *data & 0xF);
 
         for (int i = 0; i < Sides; ++i)
-            set_groups(e, item(p, i, f).precomp, order[i], f);
+            set_groups(e, e.getItem(i, f).precomp.get(), order[i], f);
     }
 
     data += (uintptr_t)data & 1; // Word alignment
 
     for (File f = FILE_A; f <= MaxFile; ++f)
         for (int i = 0; i < Sides; i++)
-            data = set_sizes(item(p, i, f).precomp, data);
+            data = set_sizes(e.getItem(i, f).precomp.get(), data);
 
-    if (!IsWDL)
-        data = set_dtz_map(e, p, data, MaxFile);
+    if (Type == DTZ)
+        data = set_dtz_map(e, data, MaxFile);
 
     for (File f = FILE_A; f <= MaxFile; ++f)
         for (int i = 0; i < Sides; i++) {
-            (d = item(p, i, f).precomp)->sparseIndex = (SparseEntry*)data;
+            (d = e.getItem(i, f).precomp.get())->sparseIndex = (SparseEntry*)data;
             data += d->sparseIndexSize * sizeof(SparseEntry);
         }
 
     for (File f = FILE_A; f <= MaxFile; ++f)
         for (int i = 0; i < Sides; i++) {
-            (d = item(p, i, f).precomp)->blockLength = (uint16_t*)data;
+            (d = e.getItem(i, f).precomp.get())->blockLength = (uint16_t*)data;
             data += d->blockLengthSize * sizeof(uint16_t);
         }
 
     for (File f = FILE_A; f <= MaxFile; ++f)
         for (int i = 0; i < Sides; i++) {
             data = (uint8_t*)(((uintptr_t)data + 0x3F) & ~0x3F); // 64 byte alignment
-            (d = item(p, i, f).precomp)->data = data;
+            (d = e.getItem(i, f).precomp.get())->data = data;
             data += d->blocksNum * d->sizeofBlock;
         }
 }
 
-template<typename Entry>
-void* init(Entry& e, const Position& pos) {
-
-    const bool IsWDL = std::is_same<Entry, WDLEntry>::value;
+template<TBType Type>
+void* init(TBEntry<Type>& e, const Position& pos) {
 
     static Mutex mutex;
 
@@ -1162,23 +1113,24 @@ void* init(Entry& e, const Position& pos) {
                                     { 0x71, 0xE8, 0x23, 0x5D } };
 
     fname =  (e.key == pos.material_key() ? w + 'v' + b : b + 'v' + w)
-           + (IsWDL ? ".rtbw" : ".rtbz");
+           + (Type == WDL ? ".rtbw" : ".rtbz");
 
-    uint8_t* data = TBFile(fname).map(&e.baseAddress, &e.mapping, TB_MAGIC[IsWDL]);
+    uint8_t* data = TBFile(fname).map(&e.baseAddress, &e.mapping,
+                                      TB_MAGIC[Type == WDL]);
     if (data)
-        e.hasPawns ? do_init(e, e.pawnTable, data) : do_init(e, e.pieceTable, data);
+        do_init(e, data);
 
     e.ready.store(true, std::memory_order_release);
     return e.baseAddress;
 }
 
-template<typename E, typename T = typename Ret<E>::type>
+template<TBType Type, typename T = typename TBEntry<Type>::Result>
 T probe_table(const Position& pos, ProbeState* result, WDLScore wdl = WDLDraw) {
 
     if (!(pos.pieces() ^ pos.pieces(KING)))
         return T(WDLDraw); // KvK
 
-    E* entry = EntryTable.get<E>(pos.material_key());
+    TBEntry<Type>* entry = EntryTable.get<Type>(pos.material_key());
 
     if (!entry || !init(*entry, pos))
         return *result = FAIL, T();
@@ -1247,7 +1199,7 @@ WDLScore search(Position& pos, ProbeState* result) {
         value = bestValue;
     else
     {
-        value = probe_table<WDLEntry>(pos, result);
+        value = probe_table<WDL>(pos, result);
 
         if (*result == FAIL)
             return WDLDraw;
@@ -1447,7 +1399,7 @@ int Tablebases::probe_dtz(Position& pos, ProbeState* result) {
     if (*result == ZEROING_BEST_MOVE)
         return dtz_before_zeroing(wdl);
 
-    int dtz = probe_table<DTZEntry>(pos, result, wdl);
+    int dtz = probe_table<DTZ>(pos, result, wdl);
 
     if (*result == FAIL)
         return 0;
