@@ -1039,7 +1039,7 @@ void do_init(TBEntry<Type>& e, uint8_t* data) {
 
     bool pp = e.hasPawns && e.pawnCount[1]; // Pawns on both sides
 
-    assert(!pp || e.table.pawnCount[0]);
+    assert(!pp || e.pawnCount[0]);
 
     for (File f = FILE_A; f <= MaxFile; ++f) {
 
