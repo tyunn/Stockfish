@@ -20,7 +20,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
-#include <cstring>   // For std::memset
+#include <cstring>   // For std::memcpy
 #include <deque>
 #include <fstream>
 #include <iostream>
