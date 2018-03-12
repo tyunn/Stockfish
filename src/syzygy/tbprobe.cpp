@@ -286,7 +286,7 @@ class HashTable {
     static const int TBHASHBITS = 10;
     static const int HSHMAX     = 5;
 
-    std::array<std::array<Entry, HSHMAX>, 1 << TBHASHBITS> hashTable;
+    Entry hashTable[1 << TBHASHBITS][HSHMAX];
 
     std::deque<TBEntry<WDL>> wdlTable;
     std::deque<TBEntry<DTZ>> dtzTable;
@@ -313,7 +313,7 @@ public:
     }
 
     void clear() {
-        hashTable = {};
+        memset(hashTable, 0, sizeof(hashTable));
         wdlTable.clear();
         dtzTable.clear();
     }
