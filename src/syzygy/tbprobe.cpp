@@ -125,14 +125,6 @@ struct PairsData {
     int groupLen[TBPIECES+1];      // Number of pieces in a given group: KRKN -> (3, 1)
 };
 
-// Helper struct to avoid manually defining entry copy constructor as we
-// should because the default one is not compatible with std::atomic_bool.
-struct Atomic {
-    Atomic() = default;
-    Atomic(const Atomic& e) { ready = e.ready.load(); } // MSVC 2013 wants assignment within body
-    std::atomic_bool ready;
-};
-
 // We define types for the different parts of the TBEntry<WDL> and TBEntry<DTZ>
 // with corresponding specializations for pieces or pawns.
 
@@ -153,11 +145,12 @@ struct EntryPiece<DTZ> {
 };
 
 template<TBType Type>
-struct TBEntryBase : public Atomic {
+struct TBEntryBase {
     typedef typename std::conditional<Type == WDL, WDLScore, int>::type Result;
 
     static constexpr int Sides = Type == WDL ? 2 : 1;
 
+    std::atomic_bool ready;
     void* baseAddress;
     uint64_t mapping;
     Key key;
