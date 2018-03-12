@@ -165,7 +165,7 @@ struct TBEntryBase {
         return file[stm % Sides][hasPawns ? f : 0];
     }
 
-    TBEntryBase() : ready(false) { }
+    TBEntryBase() : ready(false), baseAddress(nullptr) { }
     ~TBEntryBase();
 };
 
