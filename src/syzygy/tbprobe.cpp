@@ -194,6 +194,7 @@ TBEntry<WDL>::TBEntry(const std::string& code) {
     pieceCount = popcount(pos.pieces());
     hasPawns = pos.pieces(PAWN);
 
+    hasUniquePieces = false;
     for (Color c = WHITE; c <= BLACK; ++c)
         for (PieceType pt = PAWN; pt < KING; ++pt)
             if (popcount(pos.pieces(c, pt)) == 1)
