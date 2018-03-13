@@ -131,22 +131,23 @@ struct PairsData {
 enum TBType { WDL, DTZ };
 
 template<TBType Type>
-struct EntryPiece { };
+struct EntryPiece {};
 
 template<>
 struct EntryPiece<WDL> {
-    std::unique_ptr<PairsData> precomp;
+    PairsData precomp;
 };
 
 template<>
 struct EntryPiece<DTZ> {
-    std::unique_ptr<PairsData> precomp;
+    PairsData precomp;
     uint16_t map_idx[4]; // WDLWin, WDLLoss, WDLCursedWin, WDLBlessedLoss
 };
 
 template<TBType Type>
 struct TBEntryBase {
     typedef typename std::conditional<Type == WDL, WDLScore, int>::type Result;
+    typedef EntryPiece<Type> Item;
 
     static constexpr int Sides = Type == WDL ? 2 : 1;
 
@@ -159,18 +160,18 @@ struct TBEntryBase {
     bool hasPawns;
     bool hasUniquePieces;
     uint8_t pawnCount[2]; // [Lead color / other color]
-    EntryPiece<Type> file[Sides][4]; // [wtm / btm][FILE_A..FILE_D]
+    Item items[Sides][4]; // [wtm / btm][FILE_A..FILE_D or 0]
 
-    EntryPiece<Type>& getItem(int stm, int f) {
-        return file[stm % Sides][hasPawns ? f : 0];
+    Item& get(int stm, int f) {
+        return items[stm % Sides][hasPawns ? f : 0];
     }
 
-    TBEntryBase() : ready(false), baseAddress(nullptr) { }
+    TBEntryBase() : ready(false), baseAddress(nullptr) {}
     ~TBEntryBase();
 };
 
 template<TBType Type>
-struct TBEntry { };
+struct TBEntry {};
 
 // Now the main types: TBEntry<WDL> and TBEntry<DTZ>
 template<>
@@ -592,7 +593,7 @@ bool check_dtz_stm(TBEntry<WDL>*, int, File) { return true; }
 
 bool check_dtz_stm(TBEntry<DTZ>* entry, int stm, File f) {
 
-    int flags = entry->getItem(stm, f).precomp->flags;
+    int flags = entry->get(stm, f).precomp.flags;
     return   (flags & TBFlag::STM) == stm
           || ((entry->key == entry->key2) && !entry->hasPawns);
 }
@@ -607,10 +608,10 @@ int map_score(TBEntry<DTZ>* entry, File f, int value, WDLScore wdl) {
 
     const int WDLMap[] = { 1, 3, 0, 2, 0 };
 
-    int flags = entry->getItem(0, f).precomp->flags;
+    int flags = entry->get(0, f).precomp.flags;
 
     uint8_t* map = entry->map;
-    uint16_t* idx = entry->getItem(0, f).map_idx;
+    uint16_t* idx = entry->get(0, f).map_idx;
     if (flags & TBFlag::Mapped)
         value = map[idx[WDLMap[wdl + 2]] + value];
 
@@ -665,7 +666,7 @@ T do_probe_table(const Position& pos, TBEntry<Type>* entry, WDLScore wdl, ProbeS
 
         // In all the 4 tables, pawns are at the beginning of the piece sequence and
         // their color is the reference one. So we just pick the first one.
-        Piece pc = Piece(entry->getItem(0, 0).precomp->pieces[0] ^ flipColor);
+        Piece pc = Piece(entry->get(0, 0).precomp.pieces[0] ^ flipColor);
 
         assert(type_of(pc) == PAWN);
 
@@ -682,9 +683,9 @@ T do_probe_table(const Position& pos, TBEntry<Type>* entry, WDLScore wdl, ProbeS
         if (tbFile > FILE_D)
             tbFile = file_of(squares[0] ^ 7); // Horizontal flip: SQ_H1 -> SQ_A1
 
-        d = entry->getItem(stm, tbFile).precomp.get();
+        d = &entry->get(stm, tbFile).precomp;
     } else
-        d = entry->getItem(stm, tbFile).precomp.get();
+        d = &entry->get(stm, tbFile).precomp;
 
     // DTZ tables are one-sided, i.e. they store positions only for white to
     // move or only for black to move, so check for side to move to be stm,
@@ -704,7 +705,7 @@ T do_probe_table(const Position& pos, TBEntry<Type>* entry, WDLScore wdl, ProbeS
     assert(size >= 2);
 
     // Then we reorder the pieces to have the same sequence as the one stored
-    // in precomp->pieces[i]: the sequence that ensures the best compression.
+    // in precomp.pieces[i]: the sequence that ensures the best compression.
     for (int i = leadPawnsCnt; i < size; ++i)
         for (int j = i; j < size; ++j)
             if (d->pieces[i] == pieces[j])
@@ -1005,9 +1006,9 @@ uint8_t* set_dtz_map(TBEntry<DTZ>& e, uint8_t* data, File maxFile) {
     e.map = data;
 
     for (File f = FILE_A; f <= maxFile; ++f) {
-        if (e.getItem(0, f).precomp->flags & TBFlag::Mapped)
+        if (e.get(0, f).precomp.flags & TBFlag::Mapped)
             for (int i = 0; i < 4; ++i) { // Sequence like 3,x,x,x,1,x,0,2,x,x
-                e.getItem(0, f).map_idx[i] = (uint16_t)(data - e.map + 1);
+                e.get(0, f).map_idx[i] = (uint16_t)(data - e.map + 1);
                 data += *data + 1;
             }
     }
@@ -1037,7 +1038,7 @@ void do_init(TBEntry<Type>& e, uint8_t* data) {
     for (File f = FILE_A; f <= MaxFile; ++f) {
 
         for (int i = 0; i < Sides; i++)
-            e.getItem(i, f).precomp = std::unique_ptr<PairsData>(new PairsData());
+            e.get(i, f).precomp = PairsData();
 
         int order[][2] = { { *data & 0xF, pp ? *(data + 1) & 0xF : 0xF },
                            { *data >>  4, pp ? *(data + 1) >>  4 : 0xF } };
@@ -1045,37 +1046,37 @@ void do_init(TBEntry<Type>& e, uint8_t* data) {
 
         for (int k = 0; k < e.pieceCount; ++k, ++data)
             for (int i = 0; i < Sides; i++)
-                e.getItem(i, f).precomp->pieces[k] = Piece(i ? *data >>  4 : *data & 0xF);
+                e.get(i, f).precomp.pieces[k] = Piece(i ? *data >>  4 : *data & 0xF);
 
         for (int i = 0; i < Sides; ++i)
-            set_groups(e, e.getItem(i, f).precomp.get(), order[i], f);
+            set_groups(e, &e.get(i, f).precomp, order[i], f);
     }
 
     data += (uintptr_t)data & 1; // Word alignment
 
     for (File f = FILE_A; f <= MaxFile; ++f)
         for (int i = 0; i < Sides; i++)
-            data = set_sizes(e.getItem(i, f).precomp.get(), data);
+            data = set_sizes(&e.get(i, f).precomp, data);
 
     if (Type == DTZ)
         data = set_dtz_map(e, data, MaxFile);
 
     for (File f = FILE_A; f <= MaxFile; ++f)
         for (int i = 0; i < Sides; i++) {
-            (d = e.getItem(i, f).precomp.get())->sparseIndex = (SparseEntry*)data;
+            (d = &e.get(i, f).precomp)->sparseIndex = (SparseEntry*)data;
             data += d->sparseIndexSize * sizeof(SparseEntry);
         }
 
     for (File f = FILE_A; f <= MaxFile; ++f)
         for (int i = 0; i < Sides; i++) {
-            (d = e.getItem(i, f).precomp.get())->blockLength = (uint16_t*)data;
+            (d = &e.get(i, f).precomp)->blockLength = (uint16_t*)data;
             data += d->blockLengthSize * sizeof(uint16_t);
         }
 
     for (File f = FILE_A; f <= MaxFile; ++f)
         for (int i = 0; i < Sides; i++) {
             data = (uint8_t*)(((uintptr_t)data + 0x3F) & ~0x3F); // 64 byte alignment
-            (d = e.getItem(i, f).precomp.get())->data = data;
+            (d = &e.get(i, f).precomp)->data = data;
             data += d->blocksNum * d->sizeofBlock;
         }
 }
